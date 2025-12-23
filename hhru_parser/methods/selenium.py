@@ -1,4 +1,4 @@
-from src.methods.base import BaseParser
+from hhru_parser.methods.base import BaseParser
 
 
 class Selenium_Parser(BaseParser):
