@@ -5,9 +5,9 @@ from typing import List, Optional
 import aiohttp
 from bs4 import BeautifulSoup
 from aiohttp import ClientResponseError, ClientError
+from tqdm import tqdm
 
 from hhru_parser.methods import BaseParser, Vacancy
-from hhru_parser.bd.cache import Cache
 
 class AsyncHTTPParser(BaseParser):
     BASE_URL = "https://hh.ru/search/vacancy"
@@ -19,16 +19,11 @@ class AsyncHTTPParser(BaseParser):
         )
     }
 
-    def __init__(self, query: str, limit: int = 10, cache: Cache | None = None):
-        super().__init__(query, limit)
-        self.cache = cache or Cache(ttl=300)
+    def __init__(self, query: str, limit: int = 10, page: int = 0, cookies: Optional[dict] = None):
+        super().__init__(query, limit, page, cookies)
         self.current_delay = 1.0  # Initial delay in seconds
 
     async def _fetch(self, session: aiohttp.ClientSession, url: str) -> str:
-        cached = self.cache.get(url)
-        if cached:
-            return cached
-
         retries = 5
         delay = self.current_delay
 
@@ -52,7 +47,6 @@ class AsyncHTTPParser(BaseParser):
                     if self.current_delay > 1.0:
                          self.current_delay = max(1.0, self.current_delay - 0.5)
 
-                    self.cache.set(url, text)
                     return text
 
             except (ClientError, asyncio.TimeoutError) as e:
@@ -69,89 +63,143 @@ class AsyncHTTPParser(BaseParser):
 
             def get_text(selector):
                 tag = soup.select_one(selector)
-                return tag.text.strip() if tag else None
+                return tag.get_text(separator=" ", strip=True) if tag else None
+
+            # Experience fallback
+            exp = get_text('[data-qa="vacancy-experience"]') or get_text('[data-qa="work-experience-text"]')
+            
+            emp_parts = []
+            for qa in ["vacancy-view-employment-mode", "work-formats-text", "working-hours-text", "work-schedule-by-days-text", "common-employment-text"]:
+                txt = get_text(f'[data-qa="{qa}"]')
+                if txt: emp_parts.append(txt)
+            employment = ", ".join(emp_parts) if emp_parts else None
+
+            responses = get_text('[data-qa="vacancy-view-responses-count"]') or get_text('[data-qa="vacancyResponses-button-text"]')
+            viewers = get_text('[data-qa="vacancy-view-viewers-count"]')
+
+            skills_section = soup.select_one('[data-qa="skills-element"]')
+            if skills_section:
+                skills = ", ".join([s.get_text(strip=True) for s in skills_section.select('[data-qa="bloko-tag__text"], .magritte-tag__label___YHV-o_5-0-7, .magritte-tag__label, [class*="magritte-tag__label"]')])
+            else:
+                skills = None
+
+            date_tag = soup.select_one('[data-qa="vacancy-view-publication-date"]')
+            if not date_tag:
+                date_elem = soup.find(string=lambda x: x and 'опубликована' in x.lower())
+                if date_elem and date_elem.parent.name not in ['script', 'style', 'title', 'head', 'meta', 'link']:
+                    date_tag = date_elem.parent
+            
+            def clean_field(text):
+                if not text: return None
+                text = text.strip()
+                if text.startswith('{') or text.startswith('[') or len(text) > 1000:
+                    return None
+                return text
+
+            published_at = clean_field(date_tag.get_text(separator=" ", strip=True)) if date_tag else None
 
             return {
                 "description": get_text('[data-qa="vacancy-description"]'),
                 "salary": get_text('[data-qa="vacancy-salary"]'),
-                "experience": get_text('[data-qa="vacancy-experience"]'),
-                # Employment: try new common selector, then old one
-                "employment": get_text('[data-qa="common-employment-text"]') or get_text('[data-qa="vacancy-view-employment-mode"]'),
-                # Responses: try responses count, then viewers count
-                "responses": get_text('[data-qa="vacancy-view-responses-count"]') or get_text('[data-qa="vacancy-viewers-count"]'),
+                "experience": clean_field(exp),
+                "employment": clean_field(employment),
+                "responses": clean_field(responses),
+                "viewers": clean_field(viewers),
+                "skills": clean_field(skills),
+                "published_at": published_at,
             }
         except Exception as e:
             print(f"⚠️ Ошибка парсинга страницы {url}: {e}")
             return {
                 "description": None, "salary": None, "experience": None, 
-                "employment": None, "responses": None
+                "employment": None, "responses": None, "viewers": None,
+                "skills": None, "published_at": None
             }
 
     async def search(self) -> List[Vacancy]:
-        params = {
-            "text": self.query,
-            "area": 1,  # Moscow
-            "items_on_page": self.limit,
-            "search_field": "name", # Search in title
-        }
+        vacancies = []
+        current_page = self.page
+        items_per_page = 50 
 
-        async with aiohttp.ClientSession() as session:
-            url = self.BASE_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
-            try:
-                html = await self._fetch(session, url)
-            except Exception as e:
-                print(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить страницу поиска: {e}")
-                return []
+        with tqdm(total=self.limit, desc=f"HH Search: {self.query}") as pbar:
+            async with aiohttp.ClientSession(cookies=self.cookies) as session:
+                while len(vacancies) < self.limit:
+                    params = {
+                        "text": self.query,
+                        "area": 1, 
+                        "items_on_page": items_per_page,
+                        "search_field": "name",
+                        "page": current_page,
+                    }
 
-            soup = BeautifulSoup(html, "html.parser")
-            items = soup.select('[data-qa="vacancy-serp__vacancy"]')
-            
-            if not items:
-                print("⚠️ Вакансии не найдены или изменилась верстка.")
-                return []
+                    url = self.BASE_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
+                    try:
+                        html = await self._fetch(session, url)
+                    except Exception as e:
+                        tqdm.write(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось получить страницу поиска {current_page}: {e}")
+                        break
 
-            vacancies = []
-            tasks = []
+                    soup = BeautifulSoup(html, "html.parser")
+                    items = soup.select('[data-qa="vacancy-serp__vacancy"]')
+                    
+                    if not items:
+                        if current_page == self.page:
+                            print("⚠️ Вакансии не найдены или изменилась верстка.")
+                        break
 
-            for item in items[:self.limit]:
-                # Using standard selectors based on common HH structure
-                title_tag = item.select_one('[data-qa="serp-item__title"]') or item.select_one("a.bloko-link")
-                company_tag = item.select_one('[data-qa="vacancy-serp__vacancy-employer"]')
-                
-                if not title_tag:
-                    continue
+                    current_page_vacancies = []
+                    tasks = []
 
-                vacancy_url = title_tag["href"]
-                # Handle relative URLs if any (though usually absolute)
-                if not vacancy_url.startswith("http"):
-                    vacancy_url = "https://hh.ru" + vacancy_url
+                    for item in items:
+                        if len(vacancies) + len(current_page_vacancies) >= self.limit:
+                            break
 
-                try:
-                    vacancies.append(
-                        Vacancy(
-                            title=title_tag.text.strip(),
-                            company=company_tag.text.strip() if company_tag else "Unknown",
-                            salary=None, # Filled later
-                            experience=None, # Filled later
-                            employment=None, # Filled later
-                            responses=None, # Filled later
-                            description="", # Filled later
-                            url=vacancy_url,
-                        )
-                    )
-                    tasks.append(self._parse_vacancy_page(session, vacancy_url))
-                except Exception as e:
-                    print(f"Пропуск вакансии из-за ошибки: {e}")
+                        title_tag = item.select_one('[data-qa="serp-item__title"]') or item.select_one("a.bloko-link")
+                        company_tag = item.select_one('[data-qa="vacancy-serp__vacancy-employer"]')
+                        
+                        if not title_tag:
+                            continue
 
-            # Fetch details in parallel
-            if tasks:
-                details_list = await asyncio.gather(*tasks)
-                
-                for vacancy, details in zip(vacancies, details_list):
-                    vacancy.salary = details.get("salary")
-                    vacancy.experience = details.get("experience")
-                    vacancy.employment = details.get("employment")
-                    vacancy.responses = details.get("responses")
-                    vacancy.description = details.get("description", "")
+                        vacancy_url = title_tag["href"]
+                        if not vacancy_url.startswith("http"):
+                            vacancy_url = "https://hh.ru" + vacancy_url
+
+                        try:
+                            v = Vacancy(
+                                title=title_tag.text.strip(),
+                                company=company_tag.text.strip() if company_tag else "Unknown",
+                                salary=None,
+                                experience=None,
+                                employment=None,
+                                responses=None,
+                                viewers=None,
+                                skills=None,
+                                published_at=None,
+                                description="",
+                                url=vacancy_url,
+                            )
+                            current_page_vacancies.append(v)
+                            tasks.append(self._parse_vacancy_page(session, vacancy_url))
+                        except Exception as e:
+                            print(f"Пропуск вакансии из-за ошибки: {e}")
+
+                    if tasks:
+                        details_list = await asyncio.gather(*tasks)
+                        for v, details in zip(current_page_vacancies, details_list):
+                            v.salary = details.get("salary")
+                            v.experience = details.get("experience")
+                            v.employment = details.get("employment")
+                            v.responses = details.get("responses")
+                            v.viewers = details.get("viewers")
+                            v.skills = details.get("skills")
+                            v.published_at = details.get("published_at")
+                            v.description = details.get("description", "")
+                    
+                    vacancies.extend(current_page_vacancies)
+                    pbar.update(len(current_page_vacancies))
+                    current_page += 1
+
+                    if current_page > self.page + 40: 
+                        break
 
             return vacancies
